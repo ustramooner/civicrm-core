@@ -463,6 +463,37 @@ if (!defined('CIVICRM_DB_CACHE_PASSWORD')) {
 }
 
 /**
+ * Change this if your cache server requires a username (Redis ACL auth).
+ */
+if (!defined('CIVICRM_DB_CACHE_USERNAME')) {
+  define('CIVICRM_DB_CACHE_USERNAME', '');
+}
+
+/**
+ * Use Redis/Valkey persistent connections (pconnect) when TRUE.
+ */
+if (!defined('CIVICRM_DB_CACHE_REDIS_PERSISTENT')) {
+  define('CIVICRM_DB_CACHE_REDIS_PERSISTENT', FALSE);
+}
+
+/**
+ * Redis connect retry interval in milliseconds.
+ */
+if (!defined('CIVICRM_DB_CACHE_REDIS_RETRY_INTERVAL')) {
+  define('CIVICRM_DB_CACHE_REDIS_RETRY_INTERVAL', 250);
+}
+
+/**
+ * When set to a Redis set key name, PrevNextCache tracks keys in that set
+ * instead of using KEYS (unavailable on some serverless Valkey/Redis).
+ *
+ * Example: define('CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND', 'civi_prevnext_keys');
+ */
+if (!defined('CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND')) {
+  define('CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND', FALSE);
+}
+
+/**
  * Items in cache will expire after the number of seconds specified here.
  * Default value is 3600 (i.e., after an hour)
  */

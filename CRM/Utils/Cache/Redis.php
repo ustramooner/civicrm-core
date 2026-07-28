@@ -52,6 +52,13 @@ class CRM_Utils_Cache_Redis implements CRM_Utils_Cache_Interface {
   protected $_cache;
 
   /**
+   * Connection config (for reconnect after stale pconnect).
+   *
+   * @var array
+   */
+  protected $_connectConfig = [];
+
+  /**
    * Create a connection. If a connection already exists, re-use it.
    *
    * @param array $config
@@ -63,6 +70,7 @@ class CRM_Utils_Cache_Redis implements CRM_Utils_Cache_Interface {
     $socket = $config['socket'] ?? '';
     // Ugh.
     $pass = CRM_Utils_Constant::value('CIVICRM_DB_CACHE_PASSWORD');
+    $user = CRM_Utils_Constant::value('CIVICRM_DB_CACHE_USERNAME');
     if (!empty($socket)) {
       $id = implode(':', ['connect', $socket /* $pass is constant */]);
     }
@@ -81,18 +89,80 @@ class CRM_Utils_Cache_Redis implements CRM_Utils_Cache_Interface {
         }
       }
       else {
-        if (!$redis->connect($host, $port)) {
+        $persistent = (defined('CIVICRM_DB_CACHE_REDIS_PERSISTENT') && CIVICRM_DB_CACHE_REDIS_PERSISTENT)
+          || (defined('WP_REDIS_PERSISTENT') && WP_REDIS_PERSISTENT);
+        $connectMethod = $persistent ? 'pconnect' : 'connect';
+
+        $retryMs = defined('CIVICRM_DB_CACHE_REDIS_RETRY_INTERVAL')
+          ? (int) CIVICRM_DB_CACHE_REDIS_RETRY_INTERVAL
+          : 250;
+        $connTimeout = 2.0;
+        $readTimeout = 2.0;
+
+        if ($persistent) {
+          $database = 0;
+          $passwordHash = ($user || $pass) ? hash('sha256', json_encode([$user, $pass])) : '';
+          $persistentId = sprintf('%s:%s:%s:%s', $host, $port, $database, $passwordHash);
+          $args = [$host, $port, $connTimeout, $persistentId, $retryMs, $readTimeout];
+        }
+        else {
+          $args = [$host, $port, $connTimeout, NULL, $retryMs, $readTimeout];
+        }
+
+        if (!$redis->{$connectMethod}(...$args)) {
           // Don't use fatal here since we can go in an infinite loop.
           echo 'Could not connect to redisd server';
           CRM_Utils_System::civiExit();
         }
       }
-      if ($pass) {
+      if ($user && $pass) {
+        $redis->auth([$user, $pass]);
+      }
+      elseif ($pass) {
         $redis->auth($pass);
       }
       Civi::$statics[__CLASS__][$id] = $redis;
     }
     return Civi::$statics[__CLASS__][$id];
+  }
+
+  /**
+   * @param Redis $redis
+   */
+  protected static function closeRedis($redis) {
+    try {
+      @$redis->close();
+    }
+    catch (Throwable $e) {
+      // ignore — connection may already be dead
+    }
+  }
+
+  /**
+   * Run a cache op; on stale pconnect, close + reconnect once.
+   *
+   * @template T
+   * @param callable():T $fn
+   * @return T
+   */
+  protected function withRedis(callable $fn) {
+    try {
+      return $fn();
+    }
+    catch (RedisException $e) {
+      self::closeRedis($this->_cache);
+      $host = $this->_connectConfig['host'] ?? self::DEFAULT_HOST;
+      $port = $this->_connectConfig['port'] ?? self::DEFAULT_PORT;
+      $socket = $this->_connectConfig['socket'] ?? '';
+      if (!empty($socket)) {
+        unset(Civi::$statics[__CLASS__][implode(':', ['connect', $socket])]);
+      }
+      else {
+        unset(Civi::$statics[__CLASS__][implode(':', ['connect', $host, $port])]);
+      }
+      $this->_cache = self::connect($this->_connectConfig);
+      return $fn();
+    }
   }
 
   /**
@@ -114,6 +184,7 @@ class CRM_Utils_Cache_Redis implements CRM_Utils_Cache_Interface {
       $this->_prefix = CIVICRM_DEPLOY_ID . '_' . $this->_prefix;
     }
 
+    $this->_connectConfig = $config;
     $this->_cache = self::connect($config);
   }
 
@@ -131,17 +202,19 @@ class CRM_Utils_Cache_Redis implements CRM_Utils_Cache_Interface {
       return $this->delete($key);
     }
     $ttl = CRM_Utils_Date::convertCacheTtl($ttl, self::DEFAULT_TIMEOUT);
-    if (!$this->_cache->setex($this->_prefix . $key, $ttl, serialize($value))) {
-      if (PHP_SAPI === 'cli' || (Civi\Core\Container::isContainerBooted() && CRM_Core_Permission::check('view debug output'))) {
-        throw new CRM_Utils_Cache_CacheException("Redis set ($key) failed: " . $this->_cache->getLastError());
+    return $this->withRedis(function () use ($key, $value, $ttl) {
+      if (!$this->_cache->setex($this->_prefix . $key, $ttl, serialize($value))) {
+        if (PHP_SAPI === 'cli' || (Civi\Core\Container::isContainerBooted() && CRM_Core_Permission::check('view debug output'))) {
+          throw new CRM_Utils_Cache_CacheException("Redis set ($key) failed: " . $this->_cache->getLastError());
+        }
+        else {
+          Civi::log()->error("Redis set ($key) failed: " . $this->_cache->getLastError());
+          throw new CRM_Utils_Cache_CacheException("Redis set ($key) failed");
+        }
+        return FALSE;
       }
-      else {
-        Civi::log()->error("Redis set ($key) failed: " . $this->_cache->getLastError());
-        throw new CRM_Utils_Cache_CacheException("Redis set ($key) failed");
-      }
-      return FALSE;
-    }
-    return TRUE;
+      return TRUE;
+    });
   }
 
   /**
@@ -152,8 +225,10 @@ class CRM_Utils_Cache_Redis implements CRM_Utils_Cache_Interface {
    */
   public function get($key, $default = NULL) {
     CRM_Utils_Cache::assertValidKey($key);
-    $result = $this->_cache->get($this->_prefix . $key);
-    return ($result === FALSE) ? $default : unserialize($result);
+    return $this->withRedis(function () use ($key, $default) {
+      $result = $this->_cache->get($this->_prefix . $key);
+      return ($result === FALSE) ? $default : unserialize($result);
+    });
   }
 
   /**
@@ -163,8 +238,10 @@ class CRM_Utils_Cache_Redis implements CRM_Utils_Cache_Interface {
    */
   public function delete($key) {
     CRM_Utils_Cache::assertValidKey($key);
-    $this->_cache->del($this->_prefix . $key);
-    return TRUE;
+    return $this->withRedis(function () use ($key) {
+      $this->_cache->del($this->_prefix . $key);
+      return TRUE;
+    });
   }
 
   /**
@@ -175,9 +252,13 @@ class CRM_Utils_Cache_Redis implements CRM_Utils_Cache_Interface {
     // and this would be simpler. However, that needs to go in tandem with a
     // more general rethink of cache expiration/TTL.
 
-    $keys = $this->_cache->keys($this->_prefix . '*');
-    $this->_cache->del($keys);
-    return TRUE;
+    return $this->withRedis(function () {
+      $keys = $this->_cache->keys($this->_prefix . '*');
+      if ($keys !== FALSE) {
+        $this->_cache->del($keys);
+      }
+      return TRUE;
+    });
   }
 
   public function clear() {

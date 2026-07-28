@@ -105,6 +105,9 @@ class CRM_Core_PrevNextCache_Redis implements CRM_Core_PrevNextCache_Interface {
   public function markSelection($cacheKey, $action, $ids = NULL) {
     $allKey = $this->key($cacheKey, 'all');
     $selKey = $this->key($cacheKey, 'sel');
+    if (defined('CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND') && CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND) {
+      $this->redis->sAdd(CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND, $selKey);
+    }
 
     if ($action === 'select') {
       $first = TRUE;
@@ -192,12 +195,32 @@ class CRM_Core_PrevNextCache_Redis implements CRM_Core_PrevNextCache_Interface {
       $allKey = $this->key($cacheKey, 'all');
       $selKey = $this->key($cacheKey, 'sel');
       $dataKey = $this->key($cacheKey, 'data');
+      if (defined('CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND') && CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND) {
+        $this->redis->sRem(CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND, $allKey);
+        $this->redis->sRem(CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND, $selKey);
+        $this->redis->sRem(CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND, $dataKey);
+      }
       $this->redis->del($allKey, $selKey, $dataKey);
     }
     elseif ($id === NULL && $cacheKey === NULL) {
       // Delete everything.
-      $keys = $this->redis->keys($this->prefix . '*');
-      $this->redis->del($keys);
+      if (defined('CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND') && CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND) {
+        $keys = $this->redis->sMembers(CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND);
+        if ($keys !== FALSE) {
+          foreach ($keys as $key) {
+            if (strpos($key, $this->prefix) === 0) {
+              $this->redis->del($key);
+              $this->redis->sRem(CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND, $key);
+            }
+          }
+        }
+      }
+      else {
+        $keys = $this->redis->keys($this->prefix . '*');
+        if ($keys !== FALSE) {
+          $this->redis->del($keys);
+        }
+      }
     }
     elseif ($id !== NULL && $cacheKey !== NULL) {
       // Delete a specific contact, within a specific cache.
@@ -258,6 +281,11 @@ class CRM_Core_PrevNextCache_Redis implements CRM_Core_PrevNextCache_Interface {
     $allKey = $this->key($cacheKey, 'all');
     $selKey = $this->key($cacheKey, 'sel');
     $dataKey = $this->key($cacheKey, 'data');
+    if (defined('CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND') && CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND) {
+      $this->redis->sAdd(CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND, $allKey);
+      $this->redis->sAdd(CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND, $selKey);
+      $this->redis->sAdd(CIVICRM_DB_CACHE_SERVERLESS_WORKAROUND, $dataKey);
+    }
 
     $maxScore = 0;
     foreach ($this->redis->zRange($allKey, -1, -1, TRUE) as $lastElem => $lastScore) {
